@@ -648,7 +648,7 @@ def main(input_data: Dict[str, Any]) -> Dict[str, Any]:
 - **核心文件**: `src/skill_loader/loader.py`
 - **模块初始化**: `src/skill_loader/__init__.py`
 - **技能目录**: `src/skill_loader/skills/`
-- **本文档**: `SKILL加载器与选择算法文档.md`
+- **本文档**: `SKILL_LOADER.md`
 
 ### 6.2 兼容性说明
 
@@ -672,7 +672,323 @@ from skill_loader import SkillManager, get_skill_manager
 
 ---
 
-## 七、总结
+## 七、Agent框架集成案例
+
+Skill Loader 是模型无关的，可以与各种主流Agent框架集成使用。以下是常见框架的集成案例：
+
+### 7.1 LangChain 集成
+
+```python
+from langchain.agents import AgentExecutor, Tool
+from langchain_openai import ChatOpenAI
+from skill_loader import get_skill_loader
+
+# 初始化 skill loader
+loader = get_skill_loader('./skills')
+
+# 将技能转换为 LangChain Tool
+def create_langchain_tool(skill_name: str):
+    skill = loader.get_skill(skill_name)
+    
+    def tool_func(input_data: str):
+        import json
+        try:
+            data = json.loads(input_data) if input_data else {}
+        except:
+            data = {"input": input_data}
+        result = skill.execute(data)
+        return result.get('output', result)
+    
+    return Tool(
+        name=skill_name,
+        description=f"执行 {skill_name} 技能",
+        func=tool_func
+    )
+
+# 创建工具列表
+tools = [create_langchain_tool(name) for name in loader.get_skills()]
+
+# 创建 Agent
+llm = ChatOpenAI(model="gpt-4")
+agent = create_json_agent(llm, tools, prompt=...)
+agent_executor = AgentExecutor(agent=agent, tools=tools)
+
+# 执行
+result = agent_executor.invoke({
+    "input": "帮我解析 data.xlsx 文件"
+})
+```
+
+### 7.2 AutoGen 集成
+
+```python
+from autogen import ConversableAgent, AssistantAgent
+from skill_loader import get_skill_loader
+
+# 初始化 skill loader
+loader = get_skill_loader('./skills')
+
+# 创建技能执行函数
+def execute_skill(skill_name: str, input_data: dict):
+    skill = loader.get_skill(skill_name)
+    return skill.execute(input_data)
+
+# 使用示例：创建带技能的AutoGen Agent
+# 方法1：使用register_for_execution装饰器
+skill_executor = ConversableAgent(
+    name="skill_executor",
+    llm_config={"model": "gpt-4"}
+)
+
+# 注册技能函数
+for skill_name in loader.get_skills():
+    def make_wrapper(name):
+        def wrapper(**kwargs):
+            return execute_skill(name, kwargs)
+        return wrapper
+    skill_executor.register_for_execution(skill_name)(make_wrapper(skill_name))
+
+# 方法2：作为工具函数直接调用
+result = execute_skill("excel-parser", {"file_path": "data.xlsx"})
+print(result)
+```
+
+### 7.3 CrewAI 集成
+
+```python
+from crewai import Agent, Task, Crew
+from skill_loader import get_skill_loader
+
+# 初始化 skill loader
+loader = get_skill_loader('./skills')
+
+# 创建 CrewAI 工具
+def create_crew_tool(skill_name: str):
+    from crewai.tools import BaseTool
+    from pydantic import BaseModel
+    
+    skill = loader.get_skill(skill_name)
+    
+    class SkillInput(BaseModel):
+        input_data: str
+    
+    class SkillTool(BaseTool):
+        name: str = skill_name
+        description: str = f"执行 {skill_name} 技能"
+        args_schema: type = SkillInput
+        
+        def _run(self, input_data: str):
+            import json
+            try:
+                data = json.loads(input_data)
+            except:
+                data = {"input": input_data}
+            result = skill.execute(data)
+            return result
+    
+    return SkillTool()
+
+# 创建 Agent
+tools = [create_crew_tool(name) for name in loader.get_skills()]
+
+data_agent = Agent(
+    role="数据处理专家",
+    goal="帮助用户处理各种数据文件",
+    backstory="你擅长使用各种工具处理Excel、PDF等文件",
+    tools=tools
+)
+
+# 执行任务
+task = Task(
+    description="解析 data.xlsx 文件并提取数据",
+    agent=data_agent
+)
+
+crew = Crew(agents=[data_agent], tasks=[task])
+result = crew.kickoff()
+```
+
+### 7.4 独立 Agent 系统
+
+```python
+from skill_loader import get_skill_loader
+
+class SimpleAgent:
+    """简单的Skill Agent"""
+    
+    def __init__(self, skills_dir: str = None):
+        self.loader = get_skill_loader(skills_dir)
+        self.llm_predict = None
+    
+    def set_llm(self, predict_func):
+        """设置LLM预测函数"""
+        self.llm_predict = predict_func
+    
+    def run(self, user_input: str):
+        """运行Agent"""
+        # 1. 使用关键词匹配查找技能
+        skill_name = self.loader.find_skill_by_natural_language(user_input)
+        
+        # 2. 如果有多个候选，使用LLM确定
+        if isinstance(skill_name, list) and self.llm_predict:
+            skill_name = self.loader.find_skill_with_llm(
+                user_input,
+                self.llm_predict,
+                skill_name
+            )
+        
+        # 3. 如果仍未确定，返回错误
+        if not skill_name:
+            return {"status": "error", "message": "未找到合适的技能"}
+        
+        # 4. 执行技能
+        result = self.loader.execute_skill(skill_name, {"input": user_input})
+        return result
+
+# 使用示例
+agent = SimpleAgent('./skills')
+
+# 设置LLM
+def my_llm(prompt):
+    import openai
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
+
+agent.set_llm(my_llm)
+
+# 运行
+result = agent.run("帮我解析这个Excel文件")
+```
+
+### 7.5 消息队列集成（异步场景）
+
+```python
+import asyncio
+from skill_loader import get_skill_loader
+
+class AsyncSkillAgent:
+    """异步Skill Agent"""
+    
+    def __init__(self, skills_dir: str = None):
+        self.loader = get_skill_loader(skills_dir)
+    
+    async def execute_skill_async(self, skill_name: str, input_data: dict):
+        """异步执行技能"""
+        skill = self.loader.get_skill(skill_name)
+        
+        # 在线程池中执行同步代码
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            skill.execute,
+            input_data
+        )
+        return result
+    
+    async def handle_message(self, message: dict):
+        """处理消息"""
+        user_input = message.get('input', '')
+        skill_name = self.loader.find_skill_by_natural_language(user_input)
+        
+        if isinstance(skill_name, list):
+            skill_name = skill_name[0][0]  # 取最高分的
+        
+        return await self.execute_skill_async(skill_name, message)
+
+# 使用示例
+async def main():
+    agent = AsyncSkillAgent('./skills')
+    
+    result = await agent.handle_message({
+        "input": "解析Excel",
+        "file_path": "data.xlsx"
+    })
+    print(result)
+
+asyncio.run(main())
+```
+
+### 7.6 FastAPI Web服务集成
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from skill_loader import get_skill_loader
+
+app = FastAPI(title="Skill Loader API")
+loader = get_skill_loader('./skills')
+
+class SkillRequest(BaseModel):
+    skill_name: str
+    input_data: dict
+
+class NLRequest(BaseModel):
+    query: str
+    input_data: dict
+    use_llm: bool = False
+
+@app.get("/skills")
+def list_skills():
+    """列出所有可用技能"""
+    return {"skills": loader.get_skills()}
+
+@app.post("/execute")
+def execute_skill(request: SkillRequest):
+    """直接执行指定技能"""
+    result = loader.execute_skill(request.skill_name, request.input_data)
+    return result
+
+@app.post("/execute-by-query")
+def execute_by_query(request: NLRequest):
+    """通过自然语言执行技能"""
+    # 查找技能
+    skill_name = loader.find_skill_by_natural_language(request.query)
+    
+    if isinstance(skill_name, list):
+        skill_name = skill_name[0][0]
+    
+    if not skill_name:
+        raise HTTPException(status_code=404, detail="未找到匹配技能")
+    
+    # 执行
+    result = loader.execute_skill(skill_name, request.input_data)
+    return result
+
+# 启动服务
+# uvicorn main:app --reload
+```
+
+---
+
+## 八、常见问题
+
+### Q1: 如何添加新的技能？
+
+创建技能目录并添加 `SKILL.md` 文件即可，详见第五章。
+
+### Q2: 如何处理技能依赖？
+
+在 `SKILL.md` 的 `dependencies` 字段中添加依赖包，框架会自动安装。
+
+### Q3: 支持哪些执行类型？
+
+支持 `script`（脚本）、`module`（模块）、`command`（命令）三种类型。
+
+### Q4: 如何选择使用关键词匹配还是LLM匹配？
+
+- **关键词匹配**：快速、无需额外API调用，适合明确意图
+- **LLM匹配**：更准确、适合模糊意图，需要提供LLM函数
+
+### Q5: 项目级和全局技能如何选择？
+
+项目级技能会覆盖全局技能同名项，建议全局放置通用技能，项目级放置业务相关技能。
+
+---
+
+## 九、总结
 
 SKILL加载器实现了以下核心功能：
 
@@ -682,6 +998,6 @@ SKILL加载器实现了以下核心功能：
 4. **依赖管理**: 自动检查和安装依赖
 5. **单例模式**: 全局唯一实例，避免重复加载
 6. **优先级管理**: 项目级技能优先于全局技能
-7. **符合规范**: 遵循Claude Skill规范，易于扩展
+7. **框架无关**: 可与LangChain、AutoGen、CrewAI等主流Agent框架集成
 
 该模块与大模型和框架无关，可以独立使用或集成到Agent系统中。
